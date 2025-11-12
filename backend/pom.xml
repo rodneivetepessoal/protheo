@@ -47,10 +47,7 @@
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-amazon-lambda</artifactId>
         </dependency>
-        <dependency>
-            <groupId>io.quarkus</groupId>
-            <artifactId>quarkus-amazon-lambda-http</artifactId>
-        </dependency>
+        <!-- quarkus-amazon-lambda-http removido - usando handlers customizados -->
 
         <!-- AWS SDK v2 -->
         <dependency>

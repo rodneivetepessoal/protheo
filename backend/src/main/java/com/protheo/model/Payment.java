@@ -124,4 +124,27 @@ public class Payment {
         }
         return Instant.parse(disputeDeadline).isBefore(Instant.now());
     }
+
+    /**
+     * Classe para registro de transferências (usado no admin)
+     */
+    @Data
+    @Builder
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class TransferRecord {
+        private String stripeTransferId;
+        private Long amount;
+        private TransferType type;
+        private String processedAt;
+    }
+
+    /**
+     * Tipo de transferência (usado no admin)
+     */
+    public enum TransferType {
+        AUTOMATIC,  // Transferência automática
+        MANUAL,     // Transferência manual pelo admin
+        SCHEDULED   // Transferência agendada
+    }
 }

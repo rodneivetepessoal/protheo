@@ -222,14 +222,15 @@ public class AdminDashboardHandler implements RequestHandler<APIGatewayV2HTTPEve
             Transfer transfer = Transfer.create(params);
 
             // Atualizar pagamento
-            Payment.TransferRecord transferRecord = Payment.TransferRecord.builder()
-                    .stripeTransferId(transfer.getId())
+            Payment.Transfer paymentTransfer = Payment.Transfer.builder()
+                    .transferId(transfer.getId())
                     .amount(request.getAmount())
-                    .type(Payment.TransferType.MANUAL)
-                    .processedAt(Instant.now().toString())
+                    .percentage(null) // Manual transfer sem porcentagem fixa
+                    .releasedAt(Instant.now().toString())
+                    .reason(Payment.TransferReason.FINAL_RELEASE) // Manual = final release
                     .build();
 
-            payment.getTransfers().add(transferRecord);
+            payment.getTransfers().add(paymentTransfer);
             payment.setStatus(Payment.PaymentStatus.COMPLETED);
             paymentService.update(payment);
 

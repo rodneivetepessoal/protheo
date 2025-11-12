@@ -49,8 +49,8 @@ public class PaymentReleaseHandler implements RequestHandler<ScheduledEvent, Str
                                             .sortValue(Instant.now().toString())
                             )
                     ))
-                    .items()
                     .stream()
+                    .flatMap(page -> page.items().stream())
                     .filter(Payment::isDisputeDeadlineExpired)
                     .collect(Collectors.toList());
 

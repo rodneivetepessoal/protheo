@@ -281,9 +281,27 @@ public class PaymentService {
                         software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional
                                 .keyEqualTo(k -> k.partitionValue(caseId))
                 ))
-                .items()
                 .stream()
+                .flatMap(page -> page.items().stream())
                 .findFirst()
                 .orElse(null);
+    }
+
+    /**
+     * Busca pagamento por ID
+     */
+    public Payment findById(String paymentId) {
+        init();
+        return paymentsTable.getItem(r -> r.key(k -> k.partitionValue(paymentId)));
+    }
+
+    /**
+     * Atualiza pagamento
+     */
+    public Payment update(Payment payment) {
+        init();
+        payment.setUpdatedAt(Instant.now().toString());
+        paymentsTable.putItem(payment);
+        return payment;
     }
 }
