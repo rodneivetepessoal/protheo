@@ -1,0 +1,1258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Protheo MVP - Marketplace Odontológico Serverless
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Ambiente de deploy
+  
+  # Configurações de Pagamento (Customizáveis)
+  CommissionPercentage:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 30
+    Description: Porcentagem de comissão da Protheo (0-30%)
+  
+  FirstReleasePercentage:
+    Type: Number
+    Default: 70
+    MinValue: 0
+    MaxValue: 100
+    Description: Porcentagem liberada após aprovação do STL digital (0-100%)
+  
+  DisputePeriodDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 30
+    Description: Dias para contestação após recebimento do produto físico
+  
+  MaxFreeRevisions:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 10
+    Description: Número máximo de revisões gratuitas
+  
+  BudgetValidityDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+    Description: Dias de validade do orçamento
+
+Globals:
+  Function:
+    Runtime: java17
+    MemorySize: 1536
+    Timeout: 30
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        USERS_TABLE: !Ref UsersTable
+        LABS_TABLE: !Ref LabsTable
+        CASES_TABLE: !Ref CasesTable
+        BUDGETS_TABLE: !Ref BudgetsTable
+        PAYMENTS_TABLE: !Ref PaymentsTable
+        REVIEWS_TABLE: !Ref ReviewsTable
+        CONSENTS_TABLE: !Ref ConsentsTable
+        FILES_BUCKET: !Ref FilesBucket
+        CASES_QUEUE_URL: !Ref CasesQueue
+        COMMISSION_PERCENTAGE: !Ref CommissionPercentage
+        FIRST_RELEASE_PERCENTAGE: !Ref FirstReleasePercentage
+        DISPUTE_PERIOD_DAYS: !Ref DisputePeriodDays
+        MAX_FREE_REVISIONS: !Ref MaxFreeRevisions
+        BUDGET_VALIDITY_DAYS: !Ref BudgetValidityDays
+        STRIPE_SECRET_ARN: !Ref StripeSecretKey
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+        COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+    Architectures:
+      - x86_64
+
+Resources:
+  # ==================== S3 Buckets ====================
+  
+  # Bucket para arquivos STL e fotos
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub protheo-files-${Environment}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: 180
+            NoncurrentVersionExpirationInDays: 30
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedHeaders:
+              - '*'
+            MaxAge: 3600
+
+  # Bucket para frontend estático
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub protheo-frontend-${Environment}-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # ==================== CloudFront ====================
+  
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub protheo-oac-${Environment}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # ==================== Cognito ====================
+  
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub protheo-users-${Environment}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+        - Name: name
+          Required: true
+          Mutable: true
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub protheo-client-${Environment}
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ==================== DynamoDB Tables ====================
+  
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-users-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: cognitoSub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: cognito-index
+          KeySchema:
+            - AttributeName: cognitoSub
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  LabsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-labs-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: labId
+          AttributeType: S
+        - AttributeName: uf
+          AttributeType: S
+      KeySchema:
+        - AttributeName: labId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: uf-index
+          KeySchema:
+            - AttributeName: uf
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  CasesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-cases-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: caseId
+          AttributeType: S
+        - AttributeName: dentistId
+          AttributeType: S
+        - AttributeName: labId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: caseId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: dentist-index
+          KeySchema:
+            - AttributeName: dentistId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: lab-index
+          KeySchema:
+            - AttributeName: labId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  BudgetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-budgets-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: budgetId
+          AttributeType: S
+        - AttributeName: caseId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: budgetId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: case-index
+          KeySchema:
+            - AttributeName: caseId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  PaymentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-payments-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+        - AttributeName: caseId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: disputeDeadline
+          AttributeType: S
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: case-index
+          KeySchema:
+            - AttributeName: caseId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-deadline-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: disputeDeadline
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ReviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-reviews-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reviewId
+          AttributeType: S
+        - AttributeName: labId
+          AttributeType: S
+        - AttributeName: caseId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reviewId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: lab-index
+          KeySchema:
+            - AttributeName: labId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: case-index
+          KeySchema:
+            - AttributeName: caseId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ConsentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-consents-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: consentId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: consentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ==================== SQS ====================
+  
+  CasesQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub protheo-cases-${Environment}
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  # ==================== Secrets Manager ====================
+  
+  StripeSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub protheo/stripe/${Environment}
+      Description: Stripe API Keys
+      SecretString: !Sub |
+        {
+          "secret_key": "sk_test_PLACEHOLDER",
+          "webhook_secret": "whsec_PLACEHOLDER",
+          "publishable_key": "pk_test_PLACEHOLDER"
+        }
+
+  # ==================== API Gateway ====================
+  
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+        MaxAge: 600
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+              audience:
+                - !Ref CognitoUserPoolClient
+
+  # ==================== Lambda Functions ====================
+  
+  # Auth Handler
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-auth-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.auth.AuthHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConsentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:*
+              Resource: !GetAtt CognitoUserPool.Arn
+      Events:
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /auth/login
+            Method: POST
+        Register:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /auth/register
+            Method: POST
+        RefreshToken:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /auth/refresh
+            Method: POST
+
+  # Labs Handler
+  LabsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-labs-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.labs.LabsHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LabsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ReviewsTable
+      Events:
+        ListLabs:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs
+            Method: GET
+        GetLab:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs/{labId}
+            Method: GET
+        CreateLab:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Cases Handler
+  CasesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-cases-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.cases.CasesHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref LabsTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt CasesQueue.QueueName
+      Events:
+        ListCases:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        CreateCase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetCase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        UpdateCase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Presign Handler
+  PresignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-presign-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.files.PresignHandler::handleRequest
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref CasesTable
+      Events:
+        GenerateUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /files/upload-url
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GenerateDownloadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /files/download-url
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lab Actions Handler
+  LabActionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-lab-actions-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.labs.LabActionsHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsersTable
+      Events:
+        AcceptCase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs/cases/{caseId}/accept
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        RejectCase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs/cases/{caseId}/reject
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Budget Handler
+  BudgetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-budget-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.budget.BudgetHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+      Events:
+        CreateBudget:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /budgets
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetBudget:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /budgets/{budgetId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        ApproveBudget:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /budgets/{budgetId}/approve
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Project Submission Handler
+  ProjectSubmissionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-project-submission-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.project.ProjectSubmissionHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+      Events:
+        SubmitProject:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}/submit-project
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Project Approval Handler
+  ProjectApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-project-approval-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.project.ProjectApprovalHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref StripeSecretKey
+      Events:
+        ApproveProject:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}/approve-project
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        RequestRevision:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}/request-revision
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Payment Handler
+  PaymentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-payment-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.payment.PaymentHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref LabsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref StripeSecretKey
+      Events:
+        CreatePayment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /payments
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetPayment:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /payments/{paymentId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        StripeWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /webhooks/stripe
+            Method: POST
+
+  # Payment Release Handler (Scheduled)
+  PaymentReleaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-payment-release-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.payment.PaymentReleaseHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref StripeSecretKey
+      Events:
+        ScheduledRelease:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Verifica e libera pagamentos após período de contestação
+
+  # Shipping Handler
+  ShippingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-shipping-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.shipping.ShippingHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+      Events:
+        ConfirmShipping:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cases/{caseId}/shipping
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Dispute Handler
+  DisputeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-dispute-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.dispute.DisputeHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref StripeSecretKey
+      Events:
+        CreateDispute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /disputes
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetDispute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /disputes/{caseId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        ResolveDispute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /disputes/{caseId}/resolve
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Review Handler
+  ReviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-review-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.review.ReviewHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LabsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+      Events:
+        CreateReview:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /reviews
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetLabReviews:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /labs/{labId}/reviews
+            Method: GET
+
+  # GDPR Handler
+  GdprFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-gdpr-${Environment}
+      CodeUri: ../backend/
+      Handler: com.protheo.gdpr.GdprHandler::handleRequest
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CasesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConsentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ReviewsTable
+        - S3CrudPolicy:
+            BucketName: !Ref FilesBucket
+      Events:
+        ExportData:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /gdpr/export
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        DeleteData:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /gdpr/delete
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway HTTP API Endpoint
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  CloudFrontUrl:
+    Description: CloudFront Distribution URL
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontUrl
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  FilesBucketName:
+    Description: S3 Bucket for Files
+    Value: !Ref FilesBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-FilesBucket
+
+  FrontendBucketName:
+    Description: S3 Bucket for Frontend
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-FrontendBucket
+
+  CommissionPercentage:
+    Description: Configured Commission Percentage
+    Value: !Ref CommissionPercentage
+
+  FirstReleasePercentage:
+    Description: Configured First Release Percentage
+    Value: !Ref FirstReleasePercentage
+
+  DisputePeriodDays:
+    Description: Configured Dispute Period Days
+    Value: !Ref DisputePeriodDays
+
+  # ==================== Admin Tables ====================
+  
+  # Tabela de configurações de laboratórios
+  LabConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-lab-config-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: labId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: labId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # Tabela de disputas
+  DisputesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-disputes-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: disputeId
+          AttributeType: S
+        - AttributeName: caseId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: disputeId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: case-index
+          KeySchema:
+            - AttributeName: caseId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # Tabela de logs de auditoria
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub protheo-audit-log-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: logId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: logId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ==================== Admin Lambda Functions ====================
+  
+  # Handler administrativo - Laboratórios
+  AdminLabFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-admin-lab-${Environment}
+      CodeUri: ../backend/target/protheo-backend.jar
+      Handler: com.protheo.admin.AdminLabHandler::handleRequest
+      SnapStart:
+        ApplyOn: PublishedVersions
+      Environment:
+        Variables:
+          LAB_CONFIG_TABLE: !Ref LabConfigTable
+          AUDIT_LOG_TABLE: !Ref AuditLogTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LabConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+      Events:
+        GetLabs:
+          Type: HttpApi
+          Properties:
+            Path: /admin/labs
+            Method: GET
+            ApiId: !Ref HttpApi
+        UpdateLabConfig:
+          Type: HttpApi
+          Properties:
+            Path: /admin/labs/{labId}
+            Method: PUT
+            ApiId: !Ref HttpApi
+        UpdateLabStatus:
+          Type: HttpApi
+          Properties:
+            Path: /admin/labs/{labId}/status
+            Method: PUT
+            ApiId: !Ref HttpApi
+        UpdateTransferConfig:
+          Type: HttpApi
+          Properties:
+            Path: /admin/labs/{labId}/transfer-config
+            Method: PUT
+            ApiId: !Ref HttpApi
+
+  # Handler administrativo - Disputas
+  AdminDisputeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-admin-dispute-${Environment}
+      CodeUri: ../backend/target/protheo-backend.jar
+      Handler: com.protheo.admin.AdminDisputeHandler::handleRequest
+      SnapStart:
+        ApplyOn: PublishedVersions
+      Environment:
+        Variables:
+          DISPUTES_TABLE: !Ref DisputesTable
+          PAYMENTS_TABLE: !Ref PaymentsTable
+          AUDIT_LOG_TABLE: !Ref AuditLogTable
+          STRIPE_SECRET_KEY: !Sub '{{resolve:secretsmanager:protheo/stripe/${Environment}:SecretString:secret_key}}'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DisputesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+      Events:
+        ListDisputes:
+          Type: HttpApi
+          Properties:
+            Path: /admin/disputes
+            Method: GET
+            ApiId: !Ref HttpApi
+        ResolveDispute:
+          Type: HttpApi
+          Properties:
+            Path: /admin/disputes/{disputeId}/resolve
+            Method: POST
+            ApiId: !Ref HttpApi
+        ProcessRefund:
+          Type: HttpApi
+          Properties:
+            Path: /admin/disputes/{disputeId}/refund
+            Method: POST
+            ApiId: !Ref HttpApi
+
+  # Handler administrativo - Dashboard
+  AdminDashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub protheo-admin-dashboard-${Environment}
+      CodeUri: ../backend/target/protheo-backend.jar
+      Handler: com.protheo.admin.AdminDashboardHandler::handleRequest
+      SnapStart:
+        ApplyOn: PublishedVersions
+      Environment:
+        Variables:
+          PAYMENTS_TABLE: !Ref PaymentsTable
+          AUDIT_LOG_TABLE: !Ref AuditLogTable
+          STRIPE_SECRET_KEY: !Sub '{{resolve:secretsmanager:protheo/stripe/${Environment}:SecretString:secret_key}}'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+      Events:
+        GetDashboardStats:
+          Type: HttpApi
+          Properties:
+            Path: /admin/dashboard/stats
+            Method: GET
+            ApiId: !Ref HttpApi
+        GetRevenueStats:
+          Type: HttpApi
+          Properties:
+            Path: /admin/dashboard/revenue
+            Method: GET
+            ApiId: !Ref HttpApi
+        ProcessManualTransfer:
+          Type: HttpApi
+          Properties:
+            Path: /admin/transfers/manual
+            Method: POST
+            ApiId: !Ref HttpApi
+        GetPendingTransfers:
+          Type: HttpApi
+          Properties:
+            Path: /admin/transfers/pending
+            Method: GET
+            ApiId: !Ref HttpApi
+        GetAuditLogs:
+          Type: HttpApi
+          Properties:
+            Path: /admin/audit-logs
+            Method: GET
+            ApiId: !Ref HttpApi
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+  
+  CloudFrontUrl:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  
+  FrontendBucketName:
+    Description: Frontend S3 bucket name
+    Value: !Ref FrontendBucket
+  
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient

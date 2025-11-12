@@ -1,0 +1,30 @@
+{
+  "name": "protheo-frontend",
+  "version": "1.0.0",
+  "description": "Protheo - Marketplace Odontológico",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext .vue,.js,.jsx,.cjs,.mjs --fix --ignore-path .gitignore"
+  },
+  "dependencies": {
+    "vue": "^3.4.15",
+    "vue-router": "^4.2.5",
+    "pinia": "^2.1.7",
+    "axios": "^1.6.5",
+    "@stripe/stripe-js": "^2.4.0",
+    "amazon-cognito-identity-js": "^6.3.7",
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.3",
+    "vite": "^5.0.11",
+    "tailwindcss": "^3.4.1",
+    "autoprefixer": "^10.4.17",
+    "postcss": "^8.4.33",
+    "eslint": "^8.56.0",
+    "eslint-plugin-vue": "^9.20.1"
+  }
+}

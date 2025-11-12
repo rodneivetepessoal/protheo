@@ -1,0 +1,54 @@
+# ==================== General ====================
+.DS_Store
+*.log
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ==================== Backend (Java/Maven) ====================
+backend/target/
+backend/.quarkus/
+backend/.mvn/
+backend/mvnw
+backend/mvnw.cmd
+
+# ==================== Frontend (Node/Vue) ====================
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# ==================== SAM/CloudFormation ====================
+infra/.aws-sam/
+infra/samconfig.toml
+infra/packaged.yaml
+infra/.build/
+
+# ==================== AWS ====================
+.aws/
+*.pem
+*.key
+
+# ==================== Secrets ====================
+*.env
+.env.*
+!.env.example
+secrets/
+*.secret
+
+# ==================== Build artifacts ====================
+*.jar
+*.war
+*.zip
+*.tar.gz
+
+# ==================== OS ====================
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,10 @@
+{
+  "Parameters": {
+    "Environment": "dev",
+    "CommissionPercentage": "10",
+    "FirstReleasePercentage": "70",
+    "DisputePeriodDays": "14",
+    "MaxFreeRevisions": "2",
+    "BudgetValidityDays": "7"
+  }
+}

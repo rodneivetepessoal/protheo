@@ -1,0 +1,29 @@
+.
+├── README.md
+├── backend
+│   ├── pom.xml
+│   └── src
+│       └── main
+├── docs
+│   ├── ARCHITECTURE.md
+│   └── CUSTOMIZATION_GUIDE.md
+├── frontend
+│   ├── package.json
+│   ├── src
+│   │   ├── components
+│   │   ├── services
+│   │   ├── stores
+│   │   └── views
+│   ├── tailwind.config.js
+│   └── vite.config.js
+├── infra
+│   ├── parameters
+│   │   ├── dev.json
+│   │   ├── prod.json
+│   │   └── staging.json
+│   └── template.yaml
+├── project-structure.txt
+└── scripts
+    └── seed-dynamodb.py
+
+13 directories, 13 files
